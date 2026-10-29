@@ -135,7 +135,7 @@ MOD_CLASSES = ("bpsk", "qpsk", "16qam", "64qam")
 
 
 def generate_mod_batch(n: int, n_samples: int, rng: np.random.Generator,
-                       snr_db: float | tuple[float, float] = (-5.0, 20.0)):
+                       snr_db: float | tuple[float, float] = (-5.0, 20.0), cfo_max: float = 1e-3):
     """Random-phase, small-CFO, AWGN-impaired symbol streams. Returns (iq (n,2,L), labels, snr)."""
     labels = rng.integers(0, len(MOD_CLASSES), n)
     out = np.empty((n, n_samples), dtype=np.complex128)
@@ -144,7 +144,7 @@ def generate_mod_batch(n: int, n_samples: int, rng: np.random.Generator,
         const = constellation(MOD_CLASSES[lab])
         s = const[rng.integers(0, const.size, n_samples)]
         snr = snr_db if np.isscalar(snr_db) else rng.uniform(*snr_db)
-        cfo = rng.uniform(-1e-3, 1e-3)
+        cfo = rng.uniform(-cfo_max, cfo_max)
         ph = rng.uniform(0, 2 * np.pi) + 2 * np.pi * cfo * np.arange(n_samples)
         out[i] = s * np.exp(1j * ph) + crandn(n_samples, rng) * np.sqrt(10 ** (-snr / 10))
         snrs[i] = snr
