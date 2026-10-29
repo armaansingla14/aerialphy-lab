@@ -78,7 +78,7 @@ class UPlanePacket:
     def encode(self) -> bytes:
         tsym = ((self.subframe & 0xF) << 10) | ((self.slot & 0x3F) << 4) | (self.symbol & 0xF)
         app = UPLANE_HDR.pack((self.direction << 7) | 0x10, self.frame_id & 0xFF, tsym, self.port)
-        comp = ((self.iq_width & 0xF) << 4) | 0x1  # method 1 = BFP
+        comp = ((self.iq_width & 0xF) << 4) | 0x1  # method 1 = BFP; width 16 is encoded as 0
         sec = SECTION_HDR.pack(self.section_id, self.start_prb, self.num_prb, comp)
         body = app + sec + self.payload
         return ECPRI_HDR.pack(0x10, ECPRI_IQ_DATA, len(body)) + body
@@ -97,7 +97,7 @@ class UPlanePacket:
         o += SECTION_HDR.size
         return cls(direction=b0 >> 7, frame_id=fid, subframe=(tsym >> 10) & 0xF,
                    slot=(tsym >> 4) & 0x3F, symbol=tsym & 0xF, port=port, section_id=sid,
-                   start_prb=sprb, num_prb=nprb, iq_width=comp >> 4, payload=bytes(data[o:]))
+                   start_prb=sprb, num_prb=nprb, iq_width=(comp >> 4) or 16, payload=bytes(data[o:]))
 
 
 class FronthaulCodec:

@@ -69,7 +69,7 @@ def test_bfp_roundtrip_error_bound(width, rng):
         assert np.allclose(x, y)
 
 
-@pytest.mark.parametrize("width", [6, 9, 12])
+@pytest.mark.parametrize("width", [6, 9, 12, 16])
 def test_fronthaul_packet_roundtrip(width, rng):
     codec = FronthaulCodec(width)
     g = (rng.standard_normal((48, 14)) + 1j * rng.standard_normal((48, 14))) / np.sqrt(2)
