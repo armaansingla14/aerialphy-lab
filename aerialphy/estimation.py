@@ -9,62 +9,73 @@ def ls_estimate(rx_pilots: np.ndarray, tx_pilots: np.ndarray) -> np.ndarray:
     return rx_pilots / tx_pilots
 
 
-def interp_frequency(h_p: np.ndarray, pilot_sc: np.ndarray, n_sc: int) -> np.ndarray:
-    """Linear interpolation (with edge extrapolation) of pilot estimates across frequency.
+def linear_interp_matrix(pos: np.ndarray, n: int, extrapolate: bool = True) -> np.ndarray:
+    """Matrix M (n, len(pos)) so that M @ v linearly interpolates samples v taken at ``pos``.
 
-    h_p: (n_pilots, n_cols). Returns (n_sc, n_cols).
+    Outside [pos[0], pos[-1]] the end segments are extended linearly (``extrapolate``)
+    or the end value is held.
     """
-    k = np.arange(n_sc)
-    out = np.empty((n_sc, h_p.shape[1]), dtype=np.complex128)
-    for c in range(h_p.shape[1]):
-        re = np.interp(k, pilot_sc, h_p[:, c].real)
-        im = np.interp(k, pilot_sc, h_p[:, c].imag)
-        out[:, c] = re + 1j * im
-        # linear extrapolation at the edges instead of holding the value
-        if pilot_sc[0] > 0:
-            slope = (h_p[1, c] - h_p[0, c]) / (pilot_sc[1] - pilot_sc[0])
-            lo = k < pilot_sc[0]
-            out[lo, c] = h_p[0, c] + slope * (k[lo] - pilot_sc[0])
-        if pilot_sc[-1] < n_sc - 1:
-            slope = (h_p[-1, c] - h_p[-2, c]) / (pilot_sc[-1] - pilot_sc[-2])
-            hi = k > pilot_sc[-1]
-            out[hi, c] = h_p[-1, c] + slope * (k[hi] - pilot_sc[-1])
-    return out
+    pos = np.asarray(pos, dtype=float)
+    k = np.arange(n, dtype=float)
+    m = np.zeros((n, pos.size))
+    if pos.size == 1:
+        m[:, 0] = 1.0
+        return m
+    seg = np.clip(np.searchsorted(pos, k, side="right") - 1, 0, pos.size - 2)
+    t = (k - pos[seg]) / (pos[seg + 1] - pos[seg])
+    if not extrapolate:
+        t = np.clip(t, 0.0, 1.0)
+    rows = np.arange(n)
+    m[rows, seg] += 1 - t
+    m[rows, seg + 1] += t
+    return m
+
+
+def interp_frequency(h_p: np.ndarray, pilot_pos: np.ndarray, n_sc: int) -> np.ndarray:
+    """Linear interpolation across frequency with linear edge extrapolation.
+
+    h_p: (..., n_pilots, n_cols). Returns (..., n_sc, n_cols).
+    """
+    return linear_interp_matrix(pilot_pos, n_sc, extrapolate=True) @ h_p
 
 
 def interp_time(h_cols: np.ndarray, pilot_symbols: list[int], n_symbols: int) -> np.ndarray:
-    """Expand estimates at DMRS symbols to all OFDM symbols.
+    """Expand estimates at DMRS symbols (..., n_sc, n_dmrs) to all symbols (..., n_sc, n_sym).
 
-    One DMRS symbol -> hold. Several -> linear interpolation, nearest hold at edges.
+    One DMRS symbol -> hold; several -> linear interpolation, hold outside.
     """
-    if len(pilot_symbols) == 1:
-        return np.repeat(h_cols, n_symbols, axis=1)
-    t = np.arange(n_symbols)
-    out = np.empty((h_cols.shape[0], n_symbols), dtype=np.complex128)
-    for k in range(h_cols.shape[0]):
-        out[k] = np.interp(t, pilot_symbols, h_cols[k].real) + 1j * np.interp(t, pilot_symbols, h_cols[k].imag)
-    return out
+    m = linear_interp_matrix(np.asarray(pilot_symbols), n_symbols, extrapolate=False)
+    return h_cols @ m.T
 
 
-def lmmse_weights(r_full: np.ndarray, pilot_sc: np.ndarray, noise_var: float) -> np.ndarray:
+def lmmse_weights(corr_fn, n_sc: int, pilot_pos: np.ndarray, noise_var: float) -> np.ndarray:
     """W such that h_full = W @ h_ls (pilot LS estimates).
 
-    r_full: (n_sc, n_sc) frequency correlation of the channel.
+    corr_fn(df_in_subcarriers) -> E[h(k + df) h(k)^*]; pilot positions may be fractional
+    (e.g. OCC pair centres).
     """
-    r_hp = r_full[:, pilot_sc]
-    r_pp = r_full[np.ix_(pilot_sc, pilot_sc)]
-    a = r_pp + noise_var * np.eye(pilot_sc.size)
+    k = np.arange(n_sc, dtype=float)
+    r_hp = corr_fn(k[:, None] - pilot_pos[None, :])
+    r_pp = corr_fn(pilot_pos[:, None] - pilot_pos[None, :])
+    a = r_pp + noise_var * np.eye(pilot_pos.size)
     return np.linalg.solve(a.T, r_hp.T).T
 
 
-def robust_freq_correlation(n_sc: int, scs_hz: float, max_delay_s: float) -> np.ndarray:
-    """Correlation for a uniform PDP over [0, max_delay] (no knowledge of the true PDP)."""
-    k = np.arange(n_sc)
-    df = (k[:, None] - k[None, :]) * scs_hz
-    x = 2 * np.pi * df * max_delay_s
-    with np.errstate(invalid="ignore", divide="ignore"):
-        r = np.where(np.abs(x) < 1e-12, 1.0 + 0j, (1 - np.exp(-1j * x)) / (1j * x))
-    return r
+def pdp_correlation(delays_s: np.ndarray, powers: np.ndarray, scs_hz: float):
+    """Correlation function (in subcarrier offsets) implied by a known power-delay profile."""
+    def fn(dk):
+        dk = np.asarray(dk, dtype=float)
+        return np.tensordot(np.exp(-2j * np.pi * dk[..., None] * scs_hz * delays_s), powers, axes=([-1], [0]))
+    return fn
+
+
+def uniform_pdp_correlation(scs_hz: float, max_delay_s: float):
+    """Robust correlation for a uniform PDP on [0, max_delay] (true PDP unknown)."""
+    def fn(dk):
+        x = 2 * np.pi * np.asarray(dk, dtype=float) * scs_hz * max_delay_s
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return np.where(np.abs(x) < 1e-12, 1.0 + 0j, (1 - np.exp(-1j * x)) / (1j * x))
+    return fn
 
 
 def nmse_db(h_hat: np.ndarray, h: np.ndarray) -> float:
@@ -72,30 +83,27 @@ def nmse_db(h_hat: np.ndarray, h: np.ndarray) -> float:
 
 
 class PilotEstimator:
-    """Estimate the full (n_sc, n_symbols) SISO grid from DMRS pilots."""
+    """Turn LS pilot estimates into a full (n_sc, n_symbols) channel estimate."""
 
-    def __init__(self, method: str = "ls", r_full: np.ndarray | None = None):
+    def __init__(self, method: str = "ls", corr_fn=None):
         method = method.lower()
         if method not in ("ls", "lmmse"):
             raise ValueError(method)
-        if method == "lmmse" and r_full is None:
-            raise ValueError("lmmse needs a frequency correlation matrix")
+        if method == "lmmse" and corr_fn is None:
+            raise ValueError("lmmse needs a correlation function")
         self.method = method
-        self.r_full = r_full
+        self.corr_fn = corr_fn
         self._cache: dict[tuple, np.ndarray] = {}
 
-    def estimate(self, y_grid: np.ndarray, x_pilots: np.ndarray, pilot_sc: np.ndarray,
-                 pilot_symbols: list[int], noise_var: float) -> np.ndarray:
-        n_sc, n_sym = y_grid.shape
-        y_p = y_grid[np.ix_(pilot_sc, pilot_symbols)]
-        h_ls = ls_estimate(y_p, x_pilots)
+    def estimate(self, pos: np.ndarray, h_ls: np.ndarray, n_sc: int, pilot_symbols: list[int],
+                 n_symbols: int, noise_var: float) -> np.ndarray:
         if self.method == "ls":
-            h_cols = interp_frequency(h_ls, pilot_sc, n_sc)
+            h_cols = interp_frequency(h_ls, pos, n_sc)
         else:
-            key = (round(float(noise_var), 12), pilot_sc.size, int(pilot_sc[0]))
+            key = (round(float(noise_var), 12), pos.size, float(pos[0]), n_sc)
             w = self._cache.get(key)
             if w is None:
-                w = lmmse_weights(self.r_full, pilot_sc, noise_var)
+                w = lmmse_weights(self.corr_fn, n_sc, pos, noise_var)
                 self._cache[key] = w
             h_cols = w @ h_ls
-        return interp_time(h_cols, pilot_symbols, n_sym)
+        return interp_time(h_cols, pilot_symbols, n_symbols)

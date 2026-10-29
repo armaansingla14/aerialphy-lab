@@ -35,30 +35,65 @@ def dmrs_c_init(slot: int, symbol: int, n_id: int = 0, n_scid: int = 0) -> int:
 
 @dataclass
 class DmrsConfig:
-    """Type-1 (comb-2) DMRS. Each port uses a distinct comb offset (max 2 ports)."""
+    """Type-1 DMRS: two CDM groups (comb offsets 0/1), length-2 FD-OCC -> up to 4 ports.
+
+    Port p belongs to CDM group p // 2 and uses OCC w_f = [1, (-1)^(p % 2)] over
+    pilot pairs k = 4n + 2k' + group, k' in {0, 1}, as in TS 38.211 Table 7.4.1.1.2-1.
+    The full DMRS symbols are reserved (no data multiplexed on them).
+    """
 
     symbols: list[int] = field(default_factory=lambda: [2, 11])
     n_id: int = 0
 
-    def comb_offset(self, port: int) -> int:
-        if port not in (0, 1):
-            raise ValueError("comb-only DMRS supports ports 0 and 1")
-        return port
+    @staticmethod
+    def cdm_group(port: int) -> int:
+        if not 0 <= port <= 3:
+            raise ValueError("type-1 DMRS supports ports 0..3")
+        return port // 2
+
+    @staticmethod
+    def occ(port: int) -> np.ndarray:
+        return np.array([1.0, 1.0 if port % 2 == 0 else -1.0])
 
     def pilot_subcarriers(self, carrier: CarrierConfig, port: int = 0) -> np.ndarray:
-        return np.arange(self.comb_offset(port), carrier.n_sc, 2)
+        return np.arange(self.cdm_group(port), carrier.n_sc, 2)
 
     def mask(self, carrier: CarrierConfig) -> np.ndarray:
-        """All DMRS REs (both combs are reserved so data never collides)."""
         m = np.zeros((carrier.n_sc, carrier.n_symbols), dtype=bool)
         m[:, self.symbols] = True
         return m
 
-    def values(self, carrier: CarrierConfig, slot: int, port: int = 0) -> np.ndarray:
-        """Pilot values, shape (n_pilot_sc, n_dmrs_symbols)."""
+    def base_values(self, carrier: CarrierConfig, slot: int) -> np.ndarray:
+        """Unspread pilot sequence r(m), shape (n_sc // 2, n_dmrs_symbols)."""
         n = carrier.n_sc // 2
         cols = [dmrs_sequence(dmrs_c_init(slot, s, self.n_id), n) for s in self.symbols]
         return np.stack(cols, axis=1)
+
+    def values(self, carrier: CarrierConfig, slot: int, port: int = 0) -> np.ndarray:
+        """Pilot values for ``port`` incl. OCC, shape (n_pilot_sc, n_dmrs_symbols)."""
+        r = self.base_values(carrier, slot)
+        w = np.tile(self.occ(port), r.shape[0] // 2 + 1)[: r.shape[0]]
+        return r * w[:, None]
+
+    def ls_estimates(self, y: np.ndarray, carrier: CarrierConfig, slot: int, port: int,
+                     n_ports: int):
+        """LS pilot estimates for ``port`` from one receive grid y (n_sc, n_symbols).
+
+        If the port shares its CDM group with another active port, adjacent pilot
+        pairs are despread with the OCC and the estimate is placed at the pair centre.
+        Returns (subcarrier positions, estimates (n_pos, n_dmrs_symbols), noise scale).
+        """
+        sc = self.pilot_subcarriers(carrier, port)
+        r = self.base_values(carrier, slot)
+        z = y[np.ix_(sc, self.symbols)] / r
+        shared = (port ^ 1) < n_ports
+        if not shared:
+            return sc.astype(float), z, 1.0
+        npair = sc.size // 2
+        z = z[: 2 * npair].reshape(npair, 2, -1)
+        h = (z * self.occ(port)[None, :, None]).mean(axis=1)
+        pos = sc[: 2 * npair].reshape(npair, 2).mean(axis=1)
+        return pos, h, 0.5
 
 
 def build_grid(carrier: CarrierConfig, dmrs: DmrsConfig, n_ports: int, slot: int = 0) -> ResourceGrid:
