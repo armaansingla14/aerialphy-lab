@@ -114,16 +114,21 @@ class ModulationClassifier(nn.Module):
     def __init__(self, n_classes: int = 4, width: int = 32):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv1d(4, width, 7, padding=3), nn.ReLU(),
+            nn.Conv1d(8, width, 7, padding=3), nn.ReLU(),
             nn.Conv1d(width, width, 5, padding=2), nn.ReLU(),
             nn.Conv1d(width, width, 3, padding=1), nn.ReLU(),
         )
         self.head = nn.Linear(2 * width, n_classes)
 
     def forward(self, iq: torch.Tensor) -> torch.Tensor:
-        # add phase-invariant amplitude and power features as extra channels
-        amp = torch.sqrt(iq[:, 0:1] ** 2 + iq[:, 1:2] ** 2 + 1e-9)
-        x = torch.cat([iq, amp, amp ** 2], dim=1)
+        # extra input channels: amplitude, power and the squared / fourth-power signal.
+        # z^2 and z^4 collapse BPSK/QPSK onto (slowly rotating) points, which local
+        # convolutions can detect despite the unknown phase and residual CFO.
+        i, q = iq[:, 0:1], iq[:, 1:2]
+        amp2 = i ** 2 + q ** 2
+        z2r, z2i = i ** 2 - q ** 2, 2 * i * q
+        z4r, z4i = z2r ** 2 - z2i ** 2, 2 * z2r * z2i
+        x = torch.cat([iq, torch.sqrt(amp2 + 1e-9), amp2, z2r, z2i, z4r / 2, z4i / 2], dim=1)
         f = self.features(x)
         pooled = torch.cat([f.mean(dim=2), f.amax(dim=2)], dim=1)
         return self.head(pooled)
